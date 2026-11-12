@@ -5,7 +5,9 @@
   "scripts": {
     "start": "tsx src/server.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev:local": "tsx scripts/dev-local.ts",
+    "load:seed": "tsx scripts/seed-load-users.ts"
   },
   "keywords": [],
   "author": "Md. Jahidul Islam Rihan",

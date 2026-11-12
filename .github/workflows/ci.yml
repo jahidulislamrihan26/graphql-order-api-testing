@@ -4,6 +4,15 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Load profile for the load job: ci (1 minute), load (5 minutes) or stress (6 minutes, ramps up)'
+        default: ci
+        type: choice
+        options: [ci, load, stress]
+      pool:
+        description: 'PostgreSQL connections the service may open (PG_POOL_MAX)'
+        default: '20'
 
 permissions:
   contents: read
@@ -53,5 +62,59 @@ jobs:
         if: always()
         with:
           name: test-report
+          path: reports
+          if-no-files-found: ignore
+
+  # Load test with k6 against the running service, real PostgreSQL and real Redis. Results are in the job summary and the artifact.
+  load:
+    needs: test
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: shop
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/shop
+      REDIS_URL: redis://localhost:6379
+      PG_POOL_MAX: ${{ github.event.inputs.pool || '20' }}
+      PORT: '4000'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - uses: grafana/setup-k6-action@v1
+      - name: Start the service
+        run: |
+          mkdir -p reports
+          npm start > reports/service.log 2>&1 &
+          for i in $(seq 1 40); do curl -sf http://127.0.0.1:4000/health && break; sleep 1; done
+          curl -sf http://127.0.0.1:4000/health
+      - name: Create the load-test customers
+        run: npm run load:seed
+      - name: k6 load test (${{ github.event.inputs.profile || 'ci' }} profile, pool of ${{ github.event.inputs.pool || '20' }})
+        run: k6 run -e PROFILE=${{ github.event.inputs.profile || 'ci' }} load/orders.js
+      - name: Summary
+        if: always()
+        run: node scripts/summarize-load.mjs >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: load-report-${{ github.event.inputs.profile || 'ci' }}-pool${{ github.event.inputs.pool || '20' }}
           path: reports
           if-no-files-found: ignore

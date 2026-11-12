@@ -22,7 +22,7 @@ export interface App {
 /** Starts the service. `overrides` lets a test start an instance with, for example, a tiny rate limit. */
 export async function createApp(overrides: Partial<Config> = {}, options: { migrateAndSeed?: boolean } = {}): Promise<App> {
   const config = loadConfig(overrides);
-  const db = createPool(config.databaseUrl);
+  const db = createPool(config.databaseUrl, config.dbPoolMax);
   const redis = await createRedis(config.redisUrl);
   const stats = { queries: 0 };
   // count every query sent to PostgreSQL, so a test can assert that a request does not cause a query per row

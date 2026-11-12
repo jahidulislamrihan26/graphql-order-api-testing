@@ -2,6 +2,7 @@
 export interface Config {
   port: number;
   databaseUrl: string;
+  dbPoolMax: number;            // connections the service may hold open to PostgreSQL
   redisUrl?: string;            // unset: an in-memory Redis stand-in is used (quick local runs); CI and load tests use a real Redis
   webhookSecret: string;
   adminKey: string;
@@ -16,6 +17,7 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
   return {
     port: Number(env.PORT ?? 4000),
     databaseUrl: env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/shop',
+    dbPoolMax: Number(env.PG_POOL_MAX ?? 20),
     redisUrl: env.REDIS_URL,
     webhookSecret: env.WEBHOOK_SECRET ?? 'whsec_test_secret',
     adminKey: env.ADMIN_KEY ?? 'admin-secret',
