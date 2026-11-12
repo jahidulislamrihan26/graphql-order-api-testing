@@ -10,6 +10,7 @@ import http from 'k6/http';
 import crypto from 'k6/crypto';
 import { check, sleep } from 'k6';
 import { Counter, Rate, Trend } from 'k6/metrics';
+import exec from 'k6/execution';
 
 const BASE = __ENV.BASE || 'http://127.0.0.1:4000';
 const ADMIN_KEY = __ENV.ADMIN_KEY || 'admin-secret';
@@ -17,6 +18,7 @@ const SECRET = __ENV.WEBHOOK_SECRET || 'whsec_test_secret';
 const USERS = Number(__ENV.USERS || 400);
 const PROFILE = __ENV.PROFILE || 'ci';
 const PRODUCTS = 200;
+const STAGE_S = Number(__ENV.STAGE_SECONDS || 60); // length of each step of the stress ramp
 
 // ---- what is measured beyond k6's own numbers
 const journeyOk = new Rate('journey_correct');            // every step of a shopper journey did what it should
@@ -30,26 +32,41 @@ const redisMemKb = new Trend('redis_memory_kb');
 const redisHitRatio = new Trend('redis_hit_ratio');
 const serverRssMb = new Trend('server_rss_mb');
 const serverQueries = new Trend('server_queries_total');
+const serverCpuPct = new Trend('server_cpu_pct');             // share of one CPU core used by the service process
+const loopLagP99 = new Trend('event_loop_lag_p99_ms');
 
 // ---- load profiles: arrival rate (requests that keep coming even when the service slows) for browsing, and shoppers for journeys
 const PROFILES = {
   ci: { duration: '60s', browseRate: 60, shoppers: 15 },
   load: { duration: '5m', browseRate: 150, shoppers: 40 },
-  stress: { duration: '6m', browseRate: 150, shoppers: 40, ramp: [100, 250, 400, 550, 700, 850] },
+  stress: { duration: '6m', browseRate: 150, shoppers: 40, ramp: [300, 800, 1500, 2200, 3000, 3800] },
 };
 const P = PROFILES[PROFILE];
 
 const browseScenario = P.ramp
-  ? { executor: 'ramping-arrival-rate', exec: 'browse', startRate: 20, timeUnit: '1s', preAllocatedVUs: 200, maxVUs: 1500, stages: P.ramp.map((r) => ({ target: r, duration: '1m' })) }
+  ? { executor: 'ramping-arrival-rate', exec: 'browse', startRate: 20, timeUnit: '1s', preAllocatedVUs: 200, maxVUs: 1500, stages: P.ramp.map((r) => ({ target: r, duration: `${STAGE_S}s` })) }
   : { executor: 'constant-arrival-rate', exec: 'browse', rate: P.browseRate, timeUnit: '1s', duration: P.duration, preAllocatedVUs: 50, maxVUs: 400 };
+
+// Every request is tagged with the minute of the ramp it was sent in, so the report can show each load level on its own.
+const STAGES = P.ramp ? P.ramp.length : 0;
+const stageTag = () => (STAGES ? 's' + (1 + Math.min(STAGES - 1, Math.floor((Date.now() - exec.scenario.startTime) / (STAGE_S * 1000)))) : 'all');
+const stageThresholds = {};
+for (let i = 1; i <= STAGES; i++) {
+  // a threshold that can never fail, only there so k6 keeps separate figures for this stage
+  stageThresholds[`http_req_duration{scenario:browse,stage:s${i}}`] = ['max>=0'];
+  stageThresholds[`http_req_duration{scenario:journey,stage:s${i}}`] = ['max>=0'];
+  stageThresholds[`http_req_failed{stage:s${i}}`] = ['rate>=0'];
+  stageThresholds[`http_reqs{stage:s${i}}`] = ['count>=0'];
+}
 
 export const options = {
   scenarios: {
     browse: browseScenario,
-    journey: { executor: 'constant-vus', exec: 'journey', vus: P.shoppers, duration: P.ramp ? '6m' : P.duration },
-    monitor: { executor: 'constant-vus', exec: 'monitor', vus: 1, duration: P.ramp ? '6m' : P.duration },
+    journey: { executor: 'constant-vus', exec: 'journey', vus: P.shoppers, duration: P.ramp ? `${STAGE_S * P.ramp.length}s` : P.duration },
+    monitor: { executor: 'constant-vus', exec: 'monitor', vus: 1, duration: P.ramp ? `${STAGE_S * P.ramp.length}s` : P.duration },
   },
-  thresholds: {
+  // The stress profile is meant to push past the limit and report where it is, so it only measures; the other profiles must meet the targets.
+  thresholds: P.ramp ? stageThresholds : {
     'http_req_duration{scenario:browse}': ['p(95)<250', 'p(99)<600'],
     'http_req_duration{scenario:journey}': ['p(95)<1000'],
     http_req_failed: ['rate<0.01'],
@@ -62,7 +79,7 @@ export const options = {
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 const gql = (query, variables, token, tags) => http.post(`${BASE}/graphql`, JSON.stringify({ query, variables }), {
   headers: Object.assign({}, JSON_HEADERS, token ? { Authorization: `Bearer ${token}` } : {}),
-  tags,
+  tags: Object.assign({ stage: stageTag() }, tags),
 });
 const rnd = (n) => 1 + Math.floor(Math.random() * n);
 const noErrors = (res) => { try { return !JSON.parse(res.body).errors; } catch (e) { return false; } };
@@ -85,7 +102,7 @@ function signedWebhook(type, orderId) {
   const body = JSON.stringify({ id, type, orderId });
   const ts = Math.floor(Date.now() / 1000);
   const signature = 'sha256=' + crypto.hmac('sha256', SECRET, `${ts}.${body}`, 'hex');
-  return http.post(`${BASE}/webhooks/events`, body, { headers: { 'Content-Type': 'application/json', 'x-timestamp': String(ts), 'x-signature': signature }, tags: { name: 'webhook' } });
+  return http.post(`${BASE}/webhooks/events`, body, { headers: { 'Content-Type': 'application/json', 'x-timestamp': String(ts), 'x-signature': signature }, tags: { name: 'webhook', stage: stageTag() } });
 }
 
 export function journey() {
@@ -127,6 +144,8 @@ export function journey() {
 }
 
 // ----------------------------------------------------------------------------------------------------------------- monitor
+let lastCpuMs = null;
+let lastAt = null;
 export function monitor() {
   const res = http.get(`${BASE}/metrics`, { headers: { 'x-admin-key': ADMIN_KEY }, tags: { name: 'metrics' } });
   if (res.status === 200) {
@@ -141,6 +160,9 @@ export function monitor() {
     }
     if (m.process) serverRssMb.add(m.process.rssMb);
     serverQueries.add(m.queries);
+    if (m.process && lastCpuMs !== null) serverCpuPct.add((100 * (m.process.cpuMs - lastCpuMs)) / (Date.now() - lastAt));
+    if (m.process) { lastCpuMs = m.process.cpuMs; lastAt = Date.now(); }
+    if (m.eventLoopLagMs) loopLagP99.add(m.eventLoopLagMs.p99);
   }
   sleep(5);
 }
@@ -166,7 +188,17 @@ export function handleSummary(data) {
       pgConnectionsMax: pick('pg_connections', 'max'), pgActiveMax: pick('pg_active_queries', 'max'), poolWaitingMax: pick('pool_waiting_requests', 'max'),
       redisOpsPerSecMax: pick('redis_ops_per_sec', 'max'), redisMemoryKbMax: pick('redis_memory_kb', 'max'), redisHitRatioAvg: pick('redis_hit_ratio', 'avg'),
       serverRssMbMax: pick('server_rss_mb', 'max'),
+      serverCpuPctMax: pick('server_cpu_pct', 'max'), eventLoopLagP99MsMax: pick('event_loop_lag_p99_ms', 'max'),
     },
+    stages: Array.from({ length: STAGES }, (_, i) => {
+      const s = `s${i + 1}`;
+      const reqs = pick(`http_reqs{stage:${s}}`, 'count');
+      return {
+        stage: i + 1, offeredBrowseRate: P.ramp[i], achievedRequestsPerSecond: reqs == null ? null : reqs / STAGE_S,
+        browseP95: pick(`http_req_duration{scenario:browse,stage:${s}}`, 'p(95)'), browseP99: pick(`http_req_duration{scenario:browse,stage:${s}}`, 'p(99)'),
+        journeyP95: pick(`http_req_duration{scenario:journey,stage:${s}}`, 'p(95)'), failedRate: pick(`http_req_failed{stage:${s}}`, 'rate'),
+      };
+    }),
     thresholds: Object.keys(data.metrics).reduce((acc, k) => { const t = data.metrics[k].thresholds; if (t) acc[k] = Object.keys(t).map((expr) => ({ expr, ok: t[expr].ok })); return acc; }, {}),
   };
   return { 'reports/load-summary.json': JSON.stringify(summary, null, 2), stdout: '\nLoad test finished: see reports/load-summary.json\n' };

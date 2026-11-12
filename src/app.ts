@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import type { AddressInfo } from 'node:net';
 import { createSchema, createYoga } from 'graphql-yoga';
 import { GraphQLError, type ValidationRule } from 'graphql';
@@ -88,14 +89,19 @@ export async function createApp(overrides: Partial<Config> = {}, options: { migr
   };
 }
 
+const loop = monitorEventLoopDelay({ resolution: 10 });
+loop.enable();
+
 /** Resource figures for the load tests: connection pool, PostgreSQL and Redis. Needs the admin key. */
 async function metrics(req: http.IncomingMessage, res: http.ServerResponse, ctx: { db: Db; redis: RedisClient; config: Config; stats: { queries: number } }): Promise<void> {
   if (req.headers['x-admin-key'] !== ctx.config.adminKey) { res.writeHead(403); return void res.end(); }
   const out: Record<string, unknown> = {
     pool: { total: ctx.db.totalCount, idle: ctx.db.idleCount, waiting: ctx.db.waitingCount },
     queries: ctx.stats.queries,
-    process: { rssMb: Math.round(process.memoryUsage().rss / 1048576), heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1048576) },
+    process: { rssMb: Math.round(process.memoryUsage().rss / 1048576), heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1048576), cpuMs: Math.round((process.cpuUsage().user + process.cpuUsage().system) / 1000) },
+    eventLoopLagMs: { p50: +(loop.percentile(50) / 1e6).toFixed(2), p99: +(loop.percentile(99) / 1e6).toFixed(2), max: +(loop.max / 1e6).toFixed(2) },
   };
+  loop.reset();
   try {
     const { rows } = await ctx.db.query(`select (select count(*)::int from pg_stat_activity where datname = current_database()) as connections,
       (select count(*)::int from pg_stat_activity where datname = current_database() and state = 'active') as active,
