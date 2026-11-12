@@ -109,9 +109,20 @@ jobs:
         run: npm run load:seed
       - name: k6 load test (${{ github.event.inputs.profile || 'ci' }} profile, pool of ${{ github.event.inputs.pool || '20' }})
         run: k6 run -e PROFILE=${{ github.event.inputs.profile || 'ci' }} load/orders.js
+      - name: The database is still consistent after the load (stock, totals, histories, notifications)
+        if: always()
+        run: |
+          npx tsx scripts/verify-integrity.ts | tee reports/integrity.txt
       - name: Summary
         if: always()
-        run: node scripts/summarize-load.mjs >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          node scripts/summarize-load.mjs >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '### Database integrity after the load' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat reports/integrity.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
