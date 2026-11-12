@@ -17,7 +17,9 @@ const freePort = (): Promise<number> => new Promise((resolve, reject) => {
 export async function startEmbeddedPostgres(): Promise<{ url: string; stop: () => Promise<void> }> {
   const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orders-pg-'));
-  const server = new EmbeddedPostgres({ databaseDir: dir, user: 'postgres', password: 'postgres', port, persistent: false, onLog: () => undefined, onError: () => undefined });
+  const server = new EmbeddedPostgres({ databaseDir: dir, user: 'postgres', password: 'postgres', port, persistent: false, postgresFlags: ['-c', 'io_method=sync'], onLog: () => undefined, onError: () => undefined });
+  // io_method=sync: PostgreSQL 18 normally starts helper "I/O worker" processes, which on Windows can outlive the server. A throwaway
+  // test database does not need them.
   await server.initialise();
   await server.start();
   await server.createDatabase('shop');
