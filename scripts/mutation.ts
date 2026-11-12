@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { FAULTS } from '../src/faults.js';
+import { startEmbeddedPostgres } from './embeddedPostgres.js';
 
 const ROOT = path.join(import.meta.dirname, '..');
 const OUT = path.join(ROOT, 'reports', 'mutation');
@@ -30,11 +31,16 @@ function runSuite(fault: string): Run {
   return { exit: r.status ?? 1, failed, total };
 }
 
+// one throwaway PostgreSQL for the whole run (CI provides its own through DATABASE_URL)
+const embedded = process.env.DATABASE_URL ? undefined : await startEmbeddedPostgres();
+if (embedded) process.env.DATABASE_URL = embedded.url;
+
 const only = process.argv.slice(2);
 const list = FAULTS.filter(([name]) => !only.length || only.includes(name));
 
 const baseline = runSuite('');
-if (baseline.exit !== 0) { console.error('The suite fails with no fault switched on. Fix that first.', baseline.failed); process.exit(2); }
+if (baseline.exit !== 0) {
+  await embedded?.stop(); console.error('The suite fails with no fault switched on. Fix that first.', baseline.failed); process.exit(2); }
 console.log(`baseline (no fault): ${baseline.total} tests pass, as required\n`);
 
 const results = [];
@@ -60,4 +66,5 @@ const md = [
 ].join('\n');
 fs.writeFileSync(path.join(ROOT, 'docs', 'mutation-report.md'), md);
 fs.writeFileSync(path.join(ROOT, 'reports', 'mutation.json'), JSON.stringify({ date: new Date().toISOString(), killed: killedCount, total: results.length, score, results }, null, 2));
-process.exit(killedCount === results.length ? 0 : 1);
+await embedded?.stop();
+process.exitCode = killedCount === results.length ? 0 : 1; // let the process end by itself (no process.exit) so cleanup hooks run
