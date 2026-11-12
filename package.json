@@ -1,0 +1,34 @@
+{
+  "name": "graphql-order-api-testing",
+  "version": "1.0.0",
+  "description": "GraphQL order backend (PostgreSQL, Redis, webhooks) with a TypeScript API test suite and k6 load tests",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "Md. Jahidul Islam Rihan",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "dataloader": "^2.2.3",
+    "graphql": "^17.1.0",
+    "graphql-yoga": "^6.1.0",
+    "ioredis": "^5.11.1",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "embedded-postgres": "^18.6.0-beta.19",
+    "ioredis-mock": "^8.13.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  }
+}
