@@ -1,3 +1,5 @@
+import { fault } from './faults.js';
+
 export const STATUSES = ['PENDING_PAYMENT', 'PAID', 'FULFILLING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURN_REQUESTED', 'RETURNED'] as const;
 export type Status = (typeof STATUSES)[number];
 
@@ -13,7 +15,11 @@ export const ALLOWED: Record<Status, readonly Status[]> = {
   RETURNED: [],
 };
 
-export const canTransition = (from: Status, to: Status): boolean => ALLOWED[from].includes(to);
+export const canTransition = (from: Status, to: Status): boolean => {
+  if (fault('cancel-after-ship') && from === 'SHIPPED' && to === 'CANCELLED') return true;
+  if (fault('payment-after-cancel') && from === 'CANCELLED' && to === 'PAID') return true;
+  return ALLOWED[from].includes(to);
+};
 
 /** The customer notification created when an order enters a status. */
 export const NOTIFICATION_FOR: Partial<Record<Status, string>> = {

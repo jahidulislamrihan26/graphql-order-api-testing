@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg';
 import type { Db } from './db.js';
 import type { RedisClient } from './redis.js';
 import { CANCELLABLE, NOTIFICATION_FOR, canTransition, type Status } from './stateMachine.js';
+import { fault } from './faults.js';
 
 export const fail = (code: string, message: string) => new GraphQLError(message, { extensions: { code } });
 
@@ -62,10 +63,10 @@ export async function transition(client: PoolClient, orderId: string, to: Status
   );
   await client.query('insert into order_events (order_id, type, from_status, to_status, source) values ($1, $2, $3, $4, $5)', [orderId, type, from, to, source]);
   const kind = NOTIFICATION_FOR[to];
-  if (kind) await client.query('insert into notifications (user_id, order_id, kind) values ($1, $2, $3)', [rows[0].user_id, orderId, kind]);
+  if (kind && !(fault('no-notification-on-ship') && kind === 'order_shipped')) await client.query('insert into notifications (user_id, order_id, kind) values ($1, $2, $3)', [rows[0].user_id, orderId, kind]);
 
   let touchedProducts: number[] = [];
-  if (to === 'CANCELLED' && CANCELLABLE.includes(from)) {
+  if (to === 'CANCELLED' && (CANCELLABLE.includes(from) || fault('cancel-after-ship')) && !fault('no-restock-on-cancel')) {
     const restocked = await client.query<{ id: number }>(
       `update products p set stock = p.stock + oi.quantity from order_items oi where oi.order_id = $1 and oi.product_id = p.id returning p.id`,
       [orderId],
@@ -93,12 +94,12 @@ export async function checkout(db: Db, redis: RedisClient, userId: number): Prom
     let total = 0;
     const lines: Array<{ productId: number; quantity: number; price: number }> = [];
     for (const item of cart) { // in product id order, so two checkouts that share products cannot deadlock
-      const { rows } = await client.query<ProductRow>('select id, price_cents, stock from products where id = $1 for update', [item.productId]);
+      const { rows } = await client.query<ProductRow>(`select id, price_cents, stock from products where id = $1${fault('no-row-lock') ? '' : ' for update'}`, [item.productId]);
       if (!rows.length) throw fail('NOT_FOUND', `Product ${item.productId} no longer exists`);
       if (rows[0].stock < item.quantity) throw fail('INSUFFICIENT_STOCK', `Only ${rows[0].stock} of product ${item.productId} left`);
       await client.query('update products set stock = stock - $2 where id = $1', [item.productId, item.quantity]);
       lines.push({ productId: item.productId, quantity: item.quantity, price: rows[0].price_cents });
-      total += rows[0].price_cents * item.quantity;
+      total += rows[0].price_cents * (fault('total-ignores-quantity') ? 1 : item.quantity);
     }
     const created = await client.query<OrderRow>('insert into orders (user_id, status, total_cents) values ($1, $2, $3) returning *', [userId, 'PENDING_PAYMENT', total]);
     for (const l of lines) await client.query('insert into order_items (order_id, product_id, quantity, unit_price_cents) values ($1, $2, $3, $4)', [created.rows[0].id, l.productId, l.quantity, l.price]);
@@ -107,7 +108,7 @@ export async function checkout(db: Db, redis: RedisClient, userId: number): Prom
   });
 
   await redis.del(cartKey(userId));
-  await invalidateProducts(redis, cart.map((c) => c.productId)); // the cached stock figures are now wrong
+  if (!fault('stale-cache')) await invalidateProducts(redis, cart.map((c) => c.productId)); // the cached stock figures are now wrong
   return order;
 }
 
@@ -121,7 +122,7 @@ export async function requestReturn(db: Db, orderId: string, reason: string, win
   return withTx(db, async (client) => {
     const { rows } = await client.query<OrderRow>('select * from orders where id = $1 for update', [orderId]);
     if (!rows.length) throw fail('NOT_FOUND', 'Order not found');
-    if (rows[0].status === 'DELIVERED' && rows[0].delivered_at) {
+    if (rows[0].status === 'DELIVERED' && rows[0].delivered_at && !fault('no-return-window')) {
       const ageDays = (Date.now() - rows[0].delivered_at.getTime()) / 86_400_000;
       if (ageDays > windowDays) throw fail('RETURN_WINDOW_CLOSED', `Returns are accepted for ${windowDays} days after delivery`);
     }

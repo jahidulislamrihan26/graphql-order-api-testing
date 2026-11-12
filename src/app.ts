@@ -9,6 +9,7 @@ import { typeDefs } from './schema.js';
 import { createLoaders, resolvers, type Context } from './resolvers.js';
 import { depthLimit } from './depthLimit.js';
 import { handleWebhook } from './webhooks.js';
+import { fault } from './faults.js';
 
 export interface App {
   config: Config;
@@ -44,12 +45,12 @@ export async function createApp(overrides: Partial<Config> = {}, options: { migr
         const original = (error as { originalError?: { name?: string; extensions?: { code?: string }; message?: string } }).originalError;
         // GraphQL errors are meant for the client: either GraphQL itself rejected the request (syntax, validation, variable values),
         // or the service threw one of its own domain errors (INVALID_TRANSITION, ...). They pass through.
-        if (!original || original.name === 'GraphQLError') return error as Error;
+        if (!original || original.name === 'GraphQLError' || fault('leak-errors')) return error as Error;
         // Anything else is a bug or a failure inside the service (a database error, a TypeError): hide the details.
         return new GraphQLError(message, { extensions: { code: 'INTERNAL_SERVER_ERROR' } });
       },
     },
-    plugins: [{ onValidate: ({ addValidationRule }: { addValidationRule: (rule: ValidationRule) => void }) => addValidationRule(depthLimit(config.maxQueryDepth)) }],
+    plugins: [{ onValidate: ({ addValidationRule }: { addValidationRule: (rule: ValidationRule) => void }) => { if (!fault('no-depth-limit')) addValidationRule(depthLimit(config.maxQueryDepth)); } }],
     context: async ({ request }) => {
       const auth = request.headers.get('authorization') ?? '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';

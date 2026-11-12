@@ -5,6 +5,7 @@ import type { Db } from './db.js';
 import type { RedisClient } from './redis.js';
 import { invalidateProducts, transition, withTx } from './orders.js';
 import type { Status } from './stateMachine.js';
+import { fault } from './faults.js';
 
 /** `sha256=<hex>` of `<timestamp>.<raw body>`, the way a payment or shipping provider signs a callback. */
 export function signPayload(secret: string, timestamp: number | string, rawBody: string): string {
@@ -42,9 +43,9 @@ export async function handleWebhook(req: IncomingMessage, res: ServerResponse, c
   const timestamp = String(req.headers['x-timestamp'] ?? '');
   const signature = String(req.headers['x-signature'] ?? '');
   const expected = signPayload(ctx.config.webhookSecret, timestamp, raw);
-  const valid = signature.length === expected.length && crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  const valid = fault('skip-signature') || signature.length === expected.length && crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
   if (!valid) return reply(res, 401, { error: 'invalid signature' });
-  if (!/^\d+$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > ctx.config.webhookToleranceSeconds) return reply(res, 401, { error: 'timestamp outside the allowed window' });
+  if (!fault('no-timestamp-check') && (!/^\d+$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > ctx.config.webhookToleranceSeconds)) return reply(res, 401, { error: 'timestamp outside the allowed window' });
 
   // 2. what they are saying
   let event: { id?: unknown; type?: unknown; orderId?: unknown };
@@ -55,18 +56,18 @@ export async function handleWebhook(req: IncomingMessage, res: ServerResponse, c
   if (!rule) return reply(res, 422, { error: `unknown event type ${type}` });
 
   // 3. have we seen this event before? Providers retry, so the same event id must never be applied twice
-  const first = await ctx.redis.set(`webhook:${id}`, '1', 'EX', 86_400, 'NX');
+  const first = fault('no-idempotency') ? 'OK' : await ctx.redis.set(`webhook:${id}`, '1', 'EX', 86_400, 'NX');
   if (first === null) return reply(res, 200, { status: 'duplicate' });
 
   try {
     const { rows } = await ctx.db.query('select status from orders where id = $1', [orderId]);
     if (!rows.length) { await ctx.redis.del(`webhook:${id}`); return reply(res, 404, { error: 'unknown order' }); }
-    if (rule.onlyFrom && rows[0].status !== rule.onlyFrom) {
+    if (rule.onlyFrom && rows[0].status !== rule.onlyFrom && !fault('payment-failed-cancels-paid')) {
       await ctx.db.query('insert into webhook_events (event_id, type, order_id, outcome) values ($1, $2, $3, $4) on conflict do nothing', [id, type, orderId, 'ignored']);
       return reply(res, 200, { status: 'ignored', reason: `order is ${rows[0].status}` });
     }
     const inserted = await ctx.db.query('insert into webhook_events (event_id, type, order_id, outcome) values ($1, $2, $3, $4) on conflict do nothing returning event_id', [id, type, orderId, 'applied']);
-    if (!inserted.rowCount) return reply(res, 200, { status: 'duplicate' }); // second line of defence if Redis lost the key
+    if (!inserted.rowCount && !fault('no-idempotency')) return reply(res, 200, { status: 'duplicate' }); // second line of defence if Redis lost the key
     try {
       const result = await withTx(ctx.db, (client) => transition(client, orderId, rule.to, type.split('.')[0], type));
       await invalidateProducts(ctx.redis, result.touchedProducts);

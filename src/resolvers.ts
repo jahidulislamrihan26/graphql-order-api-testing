@@ -1,5 +1,6 @@
 import DataLoader from 'dataloader';
 import type { Db } from './db.js';
+import { fault } from './faults.js';
 import type { Config } from './config.js';
 import type { RedisClient } from './redis.js';
 import { CART_TTL_SECONDS, MAX_QUANTITY_PER_PRODUCT, cancelOrder, cartKey, checkout, completeReturn, fail, getProduct, readCart, requestReturn, transition, withTx, type OrderRow, type ProductRow } from './orders.js';
@@ -24,7 +25,7 @@ export function createLoaders(db: Db) {
     items: new DataLoader<string, ItemRow[]>(async (ids) => {
       const { rows } = await db.query<ItemRow>('select * from order_items where order_id = any($1::uuid[]) order by product_id', [ids]);
       return group(ids, rows);
-    }),
+    }, { batch: !fault('n-plus-one') }),
     events: new DataLoader<string, EventRow[]>(async (ids) => {
       const { rows } = await db.query<EventRow>('select * from order_events where order_id = any($1::uuid[]) order by id', [ids]);
       return group(ids, rows);
@@ -33,7 +34,7 @@ export function createLoaders(db: Db) {
       const { rows } = await db.query<ProductRow>('select id, name, price_cents, stock from products where id = any($1::int[])', [ids]);
       const byId = new Map(rows.map((r) => [r.id, r]));
       return ids.map((id) => byId.get(id) ?? null);
-    }),
+    }, { batch: !fault('n-plus-one') }),
   };
 }
 
@@ -44,11 +45,12 @@ function requireUser(ctx: Context): User {
   return ctx.user;
 }
 function requireAdmin(ctx: Context): void {
-  if (!ctx.isAdmin) throw fail('FORBIDDEN', 'This operation needs the admin key');
+  if (!ctx.isAdmin && !fault('admin-not-checked')) throw fail('FORBIDDEN', 'This operation needs the admin key');
 }
 
 /** At most `rateLimitPerMinute` mutations per user per minute, counted in Redis. */
 async function rateLimit(ctx: Context, user: User): Promise<void> {
+  if (fault('no-rate-limit')) return;
   const key = `rl:${user.id}:${Math.floor(Date.now() / 60_000)}`;
   const count = await ctx.redis.incr(key);
   if (count === 1) await ctx.redis.expire(key, 60);
@@ -59,7 +61,7 @@ async function loadOwnedOrder(ctx: Context, id: string, user: User): Promise<Ord
   if (!UUID.test(id)) throw fail('NOT_FOUND', 'Order not found');
   const { rows } = await ctx.db.query<OrderRow>('select * from orders where id = $1', [id]);
   // someone else's order looks exactly like a missing one, so order ids cannot be probed
-  if (!rows.length || (rows[0].user_id !== user.id && !ctx.isAdmin)) throw fail('NOT_FOUND', 'Order not found');
+  if (!rows.length || (rows[0].user_id !== user.id && !ctx.isAdmin && !fault('any-owner-can-act'))) throw fail('NOT_FOUND', 'Order not found');
   return rows[0];
 }
 
@@ -86,7 +88,7 @@ export const resolvers = {
     products: async (_: unknown, args: { first: number; after?: string | null }, ctx: Context) => {
       if (args.first < 1 || args.first > 100) throw fail('BAD_USER_INPUT', '"first" must be between 1 and 100');
       const after = args.after ? intArg(args.after, 'after') : 0;
-      const { rows } = await ctx.db.query<ProductRow>('select id, name, price_cents, stock from products where id > $1 order by id limit $2', [after, args.first + 1]);
+      const { rows } = await ctx.db.query<ProductRow>('select id, name, price_cents, stock from products where id ' + (fault('pagination-overlap') ? '>=' : '>') + ' $1 order by id limit $2', [after, args.first + 1]);
       const items = rows.slice(0, args.first);
       return { items, nextCursor: rows.length > args.first ? items[items.length - 1].id : null };
     },
@@ -119,7 +121,7 @@ export const resolvers = {
       const current = Number((await ctx.redis.hget(cartKey(user.id), String(productId))) ?? 0);
       if (current + args.quantity > MAX_QUANTITY_PER_PRODUCT) throw fail('BAD_USER_INPUT', `At most ${MAX_QUANTITY_PER_PRODUCT} of one product per order`);
       await ctx.redis.hset(cartKey(user.id), String(productId), String(current + args.quantity));
-      await ctx.redis.expire(cartKey(user.id), CART_TTL_SECONDS);
+      if (!fault('cart-never-expires')) await ctx.redis.expire(cartKey(user.id), CART_TTL_SECONDS);
       return cartView(ctx, user);
     },
     removeFromCart: async (_: unknown, args: { productId: string }, ctx: Context) => {
